@@ -1,0 +1,68 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - echo "Installing AWS CLI v2..."
+      - curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+      - unzip -q awscliv2.zip
+      - ./aws/install --update
+      - aws --version
+
+  build:
+    commands:
+      - echo "--------------------------"
+      - echo "🏗️  DEPLOYING CLOUDFORMATION STACK"
+      - echo "--------------------------"
+
+      - |
+        STACK_NAME="ebook-infra-stack"
+        aws cloudformation deploy \
+          --template-file contact.yaml \
+          --stack-name $STACK_NAME \
+          --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+          --no-fail-on-empty-changeset || echo "No changes detected."
+
+      - echo "✅ CloudFormation deployment complete."
+
+      - echo "--------------------------"
+      - echo "📦 FETCHING STACK OUTPUTS"
+      - echo "--------------------------"
+
+      - |
+        BUCKET=$(aws cloudformation list-exports --query "Exports[?Name=='${STACK_NAME}-S3BucketName'].Value" --output text)
+        DISTRIBUTION=$(aws cloudformation list-exports --query "Exports[?Name=='${STACK_NAME}-CloudFrontDistributionId'].Value" --output text)
+        API_URL=$(aws cloudformation list-exports --query "Exports[?Name=='${STACK_NAME}-HttpApiInvokeUrl'].Value" --output text)
+        echo "Bucket: $BUCKET"
+        echo "Distribution: $DISTRIBUTION"
+        echo "API URL: $API_URL"
+
+      - echo "--------------------------"
+      - echo "✏️  UPDATING FRONTEND API ENDPOINTS"
+      - echo "--------------------------"
+
+      # Replace placeholder text (like {{API_URL}}) inside your HTML files
+      - |
+        sed -i "s|{{API_URL_DOWNLOAD}}|${API_URL}/download|g" site/index.html
+        sed -i "s|{{API_URL_CONTACTS}}|${API_URL}/contacts|g" site/contact.html
+        echo "✅ Frontend files updated with API URLs."
+
+      - echo "--------------------------"
+      - echo "🚀 UPLOADING SITE CONTENT TO S3"
+      - echo "--------------------------"
+
+      - |
+        aws s3 sync site/ s3://$BUCKET --delete
+        echo "✅ Upload complete."
+
+      - echo "--------------------------"
+      - echo "🌍 INVALIDATING CLOUDFRONT CACHE"
+      - echo "--------------------------"
+
+      - |
+        aws cloudfront create-invalidation --distribution-id $DISTRIBUTION --paths "/*"
+        echo "✅ CloudFront invalidation complete."
+
+artifacts:
+  files:
+    - '**/*'

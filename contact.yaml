@@ -1,0 +1,438 @@
+---
+AWSTemplateFormatVersion: "2010-09-09"
+Description: This is a cloudformation stack for a serverless contact management system
+
+Parameters:
+  EnvironmentName:
+    Description: Short name used in resource names/tags
+    Type: String
+    Default: Prod
+  SiteDomain:
+    Type: String
+    Default: <DOMAIN NAME>
+    Description: The domain name for the site
+  HostedZoneId:
+    Type: String
+    Default: <HOSTED ZONE ID>
+    Description: The ID of the existing Route53 hosted zone
+  AdminEmail:
+    Type: String
+    Default: <ADMIN EMAIL ADDRESS>
+    Description: The admin identity to recieve an email for every book download
+  FrontendOrigin:
+    Type: String
+    Default: <https://EXAMPLE.COM>
+    Description: The frontend origin allowed for CORS
+  BucketName:
+    Type: String
+    Default: <BUCKET NAME>
+    Description: S3 Bucket Name
+
+
+Resources:
+  StaticContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+  BucketPolicyForCloudFront:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: CloudFrontOAI
+    Properties:
+      Bucket: !Ref StaticContentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontReadAccess
+            Effect: Allow
+            Principal:
+              CanonicalUser: !GetAtt CloudFrontOAI.S3CanonicalUserId
+            Action: s3:GetObject
+            Resource: !Sub '${StaticContentBucket.Arn}/*'
+
+  CloudFrontOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub 'OAI for ${SiteDomain}'
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    DependsOn:
+      - BucketPolicyForCloudFront
+      - ACMCertificate
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub 'Distribution for ${SiteDomain}'
+        DefaultRootObject: index.html
+        Aliases:
+          - !Ref SiteDomain
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt StaticContentBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub 'origin-access-identity/cloudfront/${CloudFrontOAI}'
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods:
+            - GET
+            - HEAD
+          Compress: true
+          CachedMethods:
+            - GET
+            - HEAD
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        ViewerCertificate:
+          AcmCertificateArn: !Ref ACMCertificate
+          SslSupportMethod: sni-only
+          MinimumProtocolVersion: TLSv1.2_2021
+
+  ACMCertificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref SiteDomain
+      ValidationMethod: DNS
+      DomainValidationOptions:
+        - DomainName: !Ref SiteDomain
+          HostedZoneId: !Ref HostedZoneId
+      Tags:
+      - Key: Name
+        Value: !Sub "${EnvironmentName}-acm-cert"
+
+  Route53AliasToCloudFront:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZoneId
+      Name: !Ref SiteDomain
+      Type: A
+      AliasTarget:
+        DNSName: !GetAtt CloudFrontDistribution.DomainName
+        HostedZoneId: Z2FDTNDATAQYW2
+
+  ApplicationSES:
+    Type: AWS::SES::EmailIdentity
+    Properties:
+      EmailIdentity: !Ref AdminEmail
+      Tags:
+      - Key: Name
+        Value: !Sub "${EnvironmentName}-email-identity"
+
+  ApplicationTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${EnvironmentName}-Contacts"
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      SSESpecification:
+        SSEEnabled: true
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${EnvironmentName}-lambda-exec"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaDDBAndSES
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowDDBOperations
+                Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:Scan
+                Resource: !GetAtt ApplicationTable.Arn
+              - Sid: AllowSESSend
+                Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: !Sub "arn:aws:ses:${AWS::Region}:${AWS::AccountId}:identity/${ApplicationSES}"
+              - Sid: AllowLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${EnvironmentName}-ContactsHandler:*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${EnvironmentName}-DownloadHandler:*"
+
+  LambdaFunctionContactsHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${EnvironmentName}-ContactsHandler"
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ApplicationTable
+          FRONTEND_ORIGIN: !Ref FrontendOrigin
+      Code:
+        ZipFile: |
+          const { DynamoDBClient, ScanCommand } = require("@aws-sdk/client-dynamodb");
+
+          const ddb = new DynamoDBClient({ region: process.env.AWS_REGION });
+          const TABLE = process.env.TABLE_NAME;
+          const ORIGIN = process.env.FRONTEND_ORIGIN;
+
+          exports.handler = async (event) => {
+            try {
+              // Parse query string parameters
+              const limit = event.queryStringParameters?.limit ? parseInt(event.queryStringParameters.limit) : 100;
+              const lastKey = event.queryStringParameters?.lastKey;
+
+              const scanParams = {
+                TableName: TABLE,
+                Limit: limit,
+                ScanFilter: {}
+              };
+
+              // Handle pagination (lastKey)
+              if (lastKey) {
+                scanParams.ExclusiveStartKey = { id: { S: lastKey } };
+              }
+
+              const result = await ddb.send(new ScanCommand(scanParams));
+
+              // Convert DynamoDB Item format to clean JSON objects
+              const items = result.Items.map(item => {
+                return Object.entries(item).reduce((acc, [key, value]) => {
+                  acc[key] = value.S;
+                  return acc;
+                }, {});
+              }).sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+              // Get the key for the next page, if any
+              const nextKey = result.LastEvaluatedKey ? result.LastEvaluatedKey.id.S : null;
+
+              return {
+                statusCode: 200,
+                headers: { 
+                  "Content-Type": "application/json",
+                  "Access-Control-Allow-Origin": ORIGIN, 
+                  "Cache-Control": "no-store",
+                },
+                body: JSON.stringify({ 
+                  items, 
+                  lastKey: nextKey
+                }),
+              };
+            } catch (err) {
+              console.error("List Lambda error:", err);
+              return {
+                statusCode: 500,
+                headers: { 
+                  "Content-Type": "application/json",
+                  "Access-Control-Allow-Origin": ORIGIN 
+                },
+                body: JSON.stringify({ error: "internal_server_error", detail: err.message }),
+              };
+            }
+          };
+    DependsOn:
+      - LambdaExecutionRole
+
+  LambdaFunctionDownloadsHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${EnvironmentName}-DownloadHandler"
+      Handler: index.handler
+      Runtime: nodejs18.x
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 10
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref ApplicationTable
+          ADMIN_EMAIL: !Ref AdminEmail
+      Code:
+        ZipFile: |
+          const { DynamoDBClient, PutItemCommand } = require("@aws-sdk/client-dynamodb");
+          const { SESClient, SendEmailCommand } = require("@aws-sdk/client-ses");
+
+          const ddb = new DynamoDBClient({ region: process.env.AWS_REGION });
+          const ses = new SESClient({ region: process.env.AWS_REGION });
+
+          const TABLE = process.env.TABLE_NAME;
+          const ADMIN = process.env.ADMIN_EMAIL;
+
+          exports.handler = async (event) => { 
+            try {
+              const body = event.body ? JSON.parse(event.body) : {};
+
+              if (!body.email) {
+                return {
+                  statusCode: 400,
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({ error: "email is required" }),
+                };
+              }
+
+              const id = Date.now().toString() + "-" + Math.random().toString(36).slice(2, 8);
+              const item = {
+                id: { S: id },
+                name: { S: body.name || "N/A" },
+                email: { S: body.email },
+                ip: { S: event.requestContext?.http?.sourceIp || "unknown" },
+                userAgent: { S: event.headers["user-agent"] || "unknown" },
+                createdAt: { S: new Date().toISOString() },
+              };
+
+              // Store record in DynamoDB
+              await ddb.send(new PutItemCommand({ TableName: TABLE, Item: item }));
+
+              // Send SES email to admin
+              const emailParams = {
+                Destination: { ToAddresses: [ADMIN] },
+                Message: {
+                  Subject: { Data: `New ebook download from ${body.email}` },
+                  Body: {
+                    Text: {
+                      Data: `New download details:\n\n${JSON.stringify(item, null, 2)}`,
+                    },
+                  },
+                },
+                Source: ADMIN,
+              };
+
+              await ses.send(new SendEmailCommand(emailParams));
+
+              return {
+                statusCode: 200,
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ ok: true }),
+              };
+            } catch (err) {
+              console.error("Lambda error:", err);
+              return {
+                statusCode: 500,
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ error: "internal_server_error", detail: err.message }),
+              };
+            }
+          };
+
+  HttpAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${EnvironmentName}-Httpapi"
+      ProtocolType: HTTP
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref FrontendOrigin
+        AllowMethods:
+          - POST
+          - GET
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        MaxAge: 3600
+
+  LambdaPermissionForDownloadsApi:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunctionDownloadsHandler
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpAPI}/*/POST/download'
+    DependsOn:
+      - LambdaFunctionDownloadsHandler
+
+  LambdaIntegrationDownloads:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt LambdaFunctionDownloadsHandler.Arn
+      PayloadFormatVersion: '2.0'
+    DependsOn:
+      - LambdaPermissionForDownloadsApi
+
+  LambdaPermissionForContactsApi:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LambdaFunctionContactsHandler
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${HttpAPI}/*/GET/contacts'
+    DependsOn:
+      - LambdaFunctionContactsHandler
+
+  LambdaIntegrationContacts:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref HttpAPI
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !GetAtt LambdaFunctionContactsHandler.Arn
+      PayloadFormatVersion: '2.0'
+    DependsOn:
+      - LambdaPermissionForContactsApi
+
+  DownloadRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpAPI
+      RouteKey: POST /download
+      Target: !Join ['', ['integrations/', !Ref LambdaIntegrationDownloads]]
+
+  ContactsRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref HttpAPI
+      RouteKey: GET /contacts
+      Target: !Join ['', ['integrations/', !Ref LambdaIntegrationContacts]]
+
+  StageProd:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      ApiId: !Ref HttpAPI
+      StageName: prod
+      AutoDeploy: true
+    DependsOn:
+      - DownloadRoute
+      - ContactsRoute
+
+Outputs:
+  HttpApiInvokeUrl:
+    Description: Invoke URL of the HTTP API
+    Value: !Sub "https://${HttpAPI}.execute-api.${AWS::Region}.amazonaws.com/prod"
+    Export:
+      Name: !Sub "${AWS::StackName}-HttpApiInvokeUrl"
+
+  S3BucketName:
+    Description: Name of the S3 bucket for static content
+    Value: !Ref StaticContentBucket
+    Export:
+      Name: !Sub "${AWS::StackName}-S3BucketName"
+
+  CloudFrontDistributionId:
+    Description: ID of the CloudFront Distribution
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub "${AWS::StackName}-CloudFrontDistributionId"
