@@ -21,7 +21,7 @@ My goal was a **fully automated deployment** with zero manual configuration usin
 
 I successfully achieved a fully serverless and automated architecture for a contact management system, overcoming multiple deployment errors. I followed best practices, prioritizing security from start to finish. This project reinforced the critical need for attention to detail when configuring Automation templates (YAML) and IAM Policies across all AWS services.
 
-![Watch the Full Application Functionality Demo Here](https://drive.google.com/file/d/10LAVKkk2wFStDSqMOq688KJHE5BMA-N5/view?usp=drivesdk)
+[Watch the Full Application Functionality Demo Here](https://drive.google.com/file/d/10LAVKkk2wFStDSqMOq688KJHE5BMA-N5/view?usp=drivesdk)
 
 ## Tech Stacks
 
