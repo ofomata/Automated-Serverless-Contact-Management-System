@@ -41,7 +41,6 @@ phases:
       - echo "✏️  UPDATING FRONTEND API ENDPOINTS"
       - echo "--------------------------"
 
-      # Replace placeholder text (like {{API_URL}}) inside your HTML files
       - |
         sed -i "s|{{API_URL_DOWNLOAD}}|${API_URL}/download|g" site/index.html
         sed -i "s|{{API_URL_CONTACTS}}|${API_URL}/contacts|g" site/contact.html
